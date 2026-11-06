@@ -1,0 +1,16 @@
+--- /tmp/gpu_config_orig.sh	2026-11-06 09:26:57.923416639 +0000
++++ /work/aosp/source/vendor/redroid/gpu_config.sh	2026-11-06 09:19:42.658796427 +0000
+@@ -37,7 +37,12 @@
+         chmod 666 "$node"
+ 
+         # setup vulkan
+-        driver=$(cut -d' ' -f1 "/sys/kernel/debug/dri/${node#/dev/dri/renderD}/name")
++        driver=$(cut -d' ' -f1 "/sys/kernel/debug/dri/${node#/dev/dri/renderD}/name" 2>/dev/null)
++        if [ -z "$driver" ]; then
++            # LXC: /sys/kernel/debug may not be mounted; fall back to sysfs uevent.
++            driver=$(grep ^DRIVER= "/sys/class/drm/$(basename "$node")/device/uevent" 2>/dev/null | cut -d= -f2)
++            [ -n "$driver" ] && echo "driver from sysfs: $driver"
++        fi
+         setup_vulkan "$driver"
+         return 0
+     fi

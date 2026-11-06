@@ -120,3 +120,36 @@ apexservice.cpp)
 `patches/0003-frameworks-base-zygote-fileintegrity.patch` (ZygoteInit.java,
 FileIntegrity.java)
 `patches/0004-lmkd-psi-fix.md` (lmkd binary offset 0xe338)
+
+## gpu_mode=host + scrcpy VAAPI (2026-11-06)
+
+### gpu_mode=host (use host GPU)
+
+The host GPU can be used for rendering. The image already contains Mesa EGL/GBM
+gralloc and `vulkan.radeon`. Deploy with the host entrypoint:
+
+    androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128
+
+Verified on an AMD Phoenix3 host (amdgpu): `ro.hardware.egl=mesa`,
+`ro.hardware.gralloc=gbm`, `gralloc.gbm.device=/dev/dri/renderD128`,
+`ro.hardware.vulkan=radeon`, `sys.boot_completed=1`, SurfaceFlinger renders
+without errors. `/dev/dri/card0` + `renderD128` are bind-mounted by
+`deploy-redroid.sh`.
+
+`patches/0005-gpu-config-vulkan-fallback.patch` makes `gpu_config.sh` detect the
+Vulkan driver from `/sys/class/drm` when `/sys/kernel/debug` is not mounted
+under LXC (so `ro.hardware.vulkan` is set automatically).
+
+### scrcpy with VAAPI hardware decode
+
+`scrcpy-redroid.sh` is a thin wrapper that auto-detects the local VAAPI driver
+(e.g. `radeonsi` on AMD) and runs `scrcpy` with hardware decode. This is a
+client-side feature (decoding uses the client GPU); the redroid server encodes
+with `OMX.google.h264.encoder`.
+
+    adb connect <redroid-ip>:5555
+    scrcpy-redroid -s <redroid-ip>:5555
+
+    LIBVA_DRIVER_NAME=radeonsi scrcpy -s <redroid-ip>:5555
+
+Verified: `scrcpy 5.0.1` -> `Video decoding: vaapi` (radeonsi, H264 VLD).

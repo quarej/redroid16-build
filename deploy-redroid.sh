@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # deploy-redroid.sh - one-shot create + configure + boot a redroid16 x86_64 LXC CT.
-# Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname]
+# Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname] [gpu_mode=guest|host]
 #   ctid: container ID (e.g. 162)
 #   ip-suffix: last octet of the guest IP, e.g. 162 -> 192.168.0.162
 #   hostname: optional (default ctredroid<ctid>)
+#   gpu_mode: guest (default) or host (use host GPU via /dev/dri)
 set -euo pipefail
 TEMPLATE=/var/lib/vz/template/cache/redroid16-lxc-x86_64-rootfs.tar.zst
-ID=${1:?Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname]}
-SUF=${2:?Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname]}
+ID=${1:?Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname] [gpu_mode=guest|host]}
+SUF=${2:?Usage: deploy-redroid.sh <ctid> <ip-suffix> [hostname] [gpu_mode=guest|host]}
 HOST=${3:-ctredroid$ID}
+GPUMODE=${4:-guest}
 IP="192.168.0.$SUF"
 [ -f "$TEMPLATE" ] || { echo "FATAL: missing template $TEMPLATE"; exit 1; }
 pct status $ID >/dev/null 2>&1 && { echo "FATAL: CT $ID already exists"; exit 1; }
@@ -24,7 +26,12 @@ CONF=/etc/pve/lxc/$ID.conf
 AA=/etc/apparmor.d/lxc/lxc-container-$ID
 AUTODEV=/etc/lxc/ct$ID-autodev.conf
 echo "== [3/6] entrypoint + lxc config + apparmor + autodev =="
-pct set $ID --entrypoint "/init qemu=1 androidboot.hardware=redroid androidboot.redroid_gpu_mode=guest androidboot.redroid_lxc_mode=1 androidboot.use_memfd=1 ro.dalvik.vm.native.bridge=libnb.so"
+if [ "$GPUMODE" = "host" ]; then
+  GPU_ARGS="androidboot.redroid_gpu_mode=host androidboot.redroid_gpu_node=/dev/dri/renderD128"
+else
+  GPU_ARGS="androidboot.redroid_gpu_mode=guest"
+fi
+pct set $ID --entrypoint "/init qemu=1 androidboot.hardware=redroid $GPU_ARGS androidboot.redroid_lxc_mode=1 androidboot.use_memfd=1 ro.dalvik.vm.native.bridge=libnb.so"
 echo "# Only CT $ID. 128 MB private /dev tmpfs for Android property areas." > $AUTODEV
 echo "lxc.autodev = 1" >> $AUTODEV
 echo "lxc.autodev.tmpfs.size = 128000000" >> $AUTODEV

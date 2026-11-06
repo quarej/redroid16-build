@@ -1,0 +1,159 @@
+diff --git a/init/builtins.cpp b/init/builtins.cpp
+index 38aed9c..9573664 100644
+--- a/init/builtins.cpp
++++ b/init/builtins.cpp
+@@ -1182,8 +1182,35 @@ static Result<void> GenerateLinkerConfiguration() {
+     const char* linkerconfig_target = "/linkerconfig";
+     const char* arguments[] = {linkerconfig_binary, "--target", linkerconfig_target};
+ 
+-    if (logwrap_fork_execvp(arraysize(arguments), arguments, nullptr, false, LOG_KLOG, false,
+-                            nullptr) != 0) {
++    if (android::base::GetBoolProperty("ro.boot.redroid_lxc_mode", false)) {
++        // logwrap requires a PTY that is not reliably usable during early LXC boot.
++        // Keep logs inside this container; never expose host /dev/kmsg.
++        pid_t child = fork();
++        if (child < 0) return ErrnoError() << "failed to fork linkerconfig";
++        if (child == 0) {
++            int fd = open("/redroid-lxc-linkerconfig.log",
++                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++            if (fd >= 0) {
++                dup2(fd, STDOUT_FILENO);
++                dup2(fd, STDERR_FILENO);
++                if (fd > STDERR_FILENO) close(fd);
++            }
++            execl(linkerconfig_binary, linkerconfig_binary, "--target", linkerconfig_target,
++                  static_cast<char*>(nullptr));
++            PLOG(ERROR) << "failed to exec linkerconfig";
++            _exit(127);
++        }
++        int status = 0;
++        pid_t waited;
++        do {
++            waited = waitpid(child, &status, 0);
++        } while (waited == -1 && errno == EINTR);
++        if (waited == -1) return ErrnoError() << "failed to wait for linkerconfig";
++        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
++            return Error() << "linkerconfig failed, wait status " << status;
++        }
++    } else if (logwrap_fork_execvp(arraysize(arguments), arguments, nullptr, false, LOG_KLOG,
++                                   false, nullptr) != 0) {
+         return ErrnoError() << "failed to execute linkerconfig";
+     }
+ 
+@@ -1191,7 +1218,11 @@ static Result<void> GenerateLinkerConfiguration() {
+     if (!current_mount_ns.ok()) {
+         return current_mount_ns.error();
+     }
+-    if (*current_mount_ns == NS_DEFAULT) {
++    // redroid LXC (flattened APEX): with ro.apex.updatable=false, init uses a
++    // single mount namespace so GetCurrentMountNamespace() always returns
++    // NS_BOOTSTRAP (bootstrap_ns_id == default_ns_id). Treat that as ready so
++    // updatable services (e.g. netd) are started instead of being delayed forever.
++    if (!NeedsTwoMountNamespaces() || *current_mount_ns == NS_DEFAULT) {
+         SetDefaultMountNamespaceReady();
+     }
+ 
+diff --git a/init/mount_namespace.cpp b/init/mount_namespace.cpp
+index 7918f23..8f9b3a3 100644
+--- a/init/mount_namespace.cpp
++++ b/init/mount_namespace.cpp
+@@ -76,7 +76,12 @@ static std::string default_ns_id;
+ 
+ // In case we have two sets of APEXes (non-updatable, updatable), we need two separate mount
+ // namespaces.
++static bool IsApexUpdatable() {
++    return android::base::GetBoolProperty("ro.apex.updatable", false);
++}
++
+ bool NeedsTwoMountNamespaces() {
++    if (!IsApexUpdatable()) return false;
+     if (IsRecoveryMode()) return false;
+     // In microdroid, there's only one set of APEXes in built-in directories include block devices.
+     if (IsMicrodroid()) return false;
+@@ -193,7 +198,7 @@ bool SetupMountNamespaces() {
+ // Switch the mount namespace of the current process from bootstrap to default OR from default to
+ // bootstrap. If the current mount namespace is neither bootstrap nor default, keep it that way.
+ Result<void> SwitchToMountNamespaceIfNeeded(MountNamespace target_mount_namespace) {
+-    if (IsRecoveryMode()) {
++    if (IsRecoveryMode() || !IsApexUpdatable()) {
+         // we don't have multiple namespaces in recovery mode or if apex is not updatable
+         return {};
+     }
+diff --git a/init/security.cpp b/init/security.cpp
+index a0d63bc..ef3bac2 100644
+--- a/init/security.cpp
++++ b/init/security.cpp
+@@ -102,6 +102,8 @@ static bool SetMmapRndBitsMin(int start, int min, bool compat) {
+ // ec9ee4acd97c drivers: char: random: add get_random_long()
+ // 5ef11c35ce86 mm: ASLR: use get_random_long()
+ Result<void> SetMmapRndBitsAction(const BuiltinArguments&) {
++    // LXC shares these sysctls with the host; do not write them.
++    if (android::base::GetBoolProperty("ro.boot.redroid_lxc_mode", false)) return {};
+ // values are arch-dependent
+ #if defined(USER_MODE_LINUX)
+     // uml does not support mmap_rnd_bits
+@@ -152,6 +154,8 @@ Result<void> SetMmapRndBitsAction(const BuiltinArguments&) {
+ //
+ // Aborts if unable to set this to an acceptable value.
+ Result<void> SetKptrRestrictAction(const BuiltinArguments&) {
++    // Leave host-global kptr_restrict unchanged in LXC mode.
++    if (android::base::GetBoolProperty("ro.boot.redroid_lxc_mode", false)) return {};
+     std::string path = KPTR_RESTRICT_PATH;
+ 
+     if (!SetHighestAvailableOptionValue(path, KPTR_RESTRICT_MINVALUE, KPTR_RESTRICT_MAXVALUE)) {
+diff --git a/init/util.cpp b/init/util.cpp
+index 375e905..0f9786d 100644
+--- a/init/util.cpp
++++ b/init/util.cpp
+@@ -666,6 +666,23 @@ void SetStdioToDevNull(char** argv) {
+ void InitKernelLogging(char** argv) {
+     SetFatalRebootTarget();
+     android::base::InitLogging(argv, &android::base::KernelLogger, InitAborter);
++    // Scoped diagnostic: avoid passing the host-global /dev/kmsg into LXC.
++    if (access("/system/etc/redroid-lxc-debug", F_OK) == 0) {
++        android::base::SetLogger([](android::base::LogId, android::base::LogSeverity,
++                                    const char*, const char*, unsigned int,
++                                    const char* message) {
++            int fd = open("/redroid-lxc-init.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
++                          0644);
++            if (fd >= 0) {
++                const ssize_t written = write(fd, message, strlen(message));
++                if (written >= 0) {
++                    const ssize_t newline_written = write(fd, "\n", 1);
++                    (void)newline_written;
++                }
++                close(fd);
++            }
++        });
++    }
+ }
+ 
+ bool IsRecoveryMode() {
+diff --git a/libcutils/ashmem-dev.cpp b/libcutils/ashmem-dev.cpp
+index f4d9e2a..d4eeb7a 100644
+--- a/libcutils/ashmem-dev.cpp
++++ b/libcutils/ashmem-dev.cpp
+@@ -134,17 +134,12 @@ static bool __has_memfd_support() {
+         return false;
+     }
+ 
+-    /*
+-     * Ensure that the kernel supports ashmem ioctl commands on memfds. If not,
+-     * fall back to using ashmem.
+-     */
+-    int ashmem_size = TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_GET_SIZE, 0));
+-    if (ashmem_size != static_cast<int>(buf_size)) {
+-        ALOGE("ioctl(ASHMEM_GET_SIZE): %d != buf_size: %zd , no ashmem-memfd compat support",
+-              ashmem_size, buf_size);
+-        return false;
+-    }
+-
++    // P12b: The container kernel does not support ashmem ioctl commands on memfds
++    // (ioctl(ASHMEM_GET_SIZE) fails on a memfd). The original code treated that as
++    // "no ashmem-memfd compat support" and returned false, which made the 32-bit
++    // libcutils has_memfd_support() fall back to direct ashmem ioctl and break
++    // WebView (bindApplication fails -> ANR). Treat memfd_create+seal+ftruncate
++    // success as support (matching 64-bit behaviour) so 32/64-bit both use memfd.
+     if (debug_log) {
+         ALOGD("memfd: device has memfd support, using it");
+     }

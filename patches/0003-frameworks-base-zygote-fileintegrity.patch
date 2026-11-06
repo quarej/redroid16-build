@@ -1,0 +1,47 @@
+diff --git a/core/java/com/android/internal/os/ZygoteInit.java b/core/java/com/android/internal/os/ZygoteInit.java
+index 38dc198fa..7208dcfde 100644
+--- a/core/java/com/android/internal/os/ZygoteInit.java
++++ b/core/java/com/android/internal/os/ZygoteInit.java
+@@ -699,11 +699,11 @@ public class ZygoteInit {
+                 (1L << OsConstants.CAP_NET_BIND_SERVICE) |
+                 (1L << OsConstants.CAP_NET_BROADCAST) |
+                 (1L << OsConstants.CAP_NET_RAW) |
+-                (1L << OsConstants.CAP_SYS_MODULE) |
++                (1L << OsConstants.CAP_CHOWN) |  // P12a
+                 (1L << OsConstants.CAP_SYS_NICE) |
+                 (1L << OsConstants.CAP_SYS_PTRACE) |
+-                (1L << OsConstants.CAP_SYS_TIME) |
+-                (1L << OsConstants.CAP_SYS_TTY_CONFIG) |
++                (1L << OsConstants.CAP_DAC_OVERRIDE) |  // P12a
++                (1L << OsConstants.CAP_FOWNER) |  // P12a
+                 (1L << OsConstants.CAP_WAKE_ALARM) |
+                 (1L << OsConstants.CAP_BLOCK_SUSPEND);
+         /* Containers run without some capabilities, so drop any caps that are not available. */
+diff --git a/services/core/java/com/android/server/security/FileIntegrity.java b/services/core/java/com/android/server/security/FileIntegrity.java
+index b8f187e0e..88ee12a83 100644
+--- a/services/core/java/com/android/server/security/FileIntegrity.java
++++ b/services/core/java/com/android/server/security/FileIntegrity.java
+@@ -46,9 +46,12 @@ public final class FileIntegrity {
+      */
+     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+     public static void setUpFsVerity(@NonNull File file) throws IOException {
+-        try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(file, MODE_READ_ONLY)) {
+-            setUpFsVerity(pfd);
+-        }
++        // P13b: The container kernel has no fs-verity (CONFIG_FS_VERITY unset), so
++        // VerityUtils.setUpFsverity() ioctl always fails. Callers (AccessPersistence,
++        // ResilientAtomicFile) treat the resulting IOException as a write failure and abort,
++        // so runtime-permissions / package-restrictions / shortcut writes never persist.
++        // Make this a no-op so writes proceed normally. Restore the original body if the
++        // target kernel enables CONFIG_FS_VERITY.
+     }
+ 
+     /**
+@@ -63,6 +66,6 @@ public final class FileIntegrity {
+     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+     public static void setUpFsVerity(@NonNull ParcelFileDescriptor parcelFileDescriptor)
+             throws IOException {
+-        VerityUtils.setUpFsverity(parcelFileDescriptor.getFd());
++        // P13b: no-op, see setUpFsVerity(File) comment above.
+     }
+ }

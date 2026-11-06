@@ -1,0 +1,229 @@
+diff --git a/apexd/apexd.cpp b/apexd/apexd.cpp
+index 9e3c915..a6426f1 100644
+--- a/apexd/apexd.cpp
++++ b/apexd/apexd.cpp
+@@ -2733,9 +2733,12 @@ void OnStart() {
+ }
+ 
+ void OnAllPackagesActivated(bool is_bootstrap) {
+-  auto result = EmitApexInfoList(is_bootstrap);
+-  if (!result.ok()) {
+-    LOG(ERROR) << "cannot emit apex info list: " << result.error();
++  // Flattened APEX activation already populated apex-info-list.xml.
++  if (android::sysprop::ApexProperties::updatable().value_or(false)) {
++    auto result = EmitApexInfoList(is_bootstrap);
++    if (!result.ok()) {
++      LOG(ERROR) << "cannot emit apex info list: " << result.error();
++    }
+   }
+ 
+   // Because apexd in bootstrap mode runs in blocking mode
+@@ -3139,6 +3142,67 @@ void CollectApexInfoList(std::ostream& os,
+   com::android::apex::write(os, apex_info_list);
+ }
+ 
++
++// Prototype of the Android 13 flattened APEX path, adapted to the Android 16
++// partition map and generated ApexInfo metadata. Requires actual boot testing.
++int ActivateFlattenedApex() {
++  std::vector<com::android::apex::ApexInfo> infos;
++
++  for (const auto& [partition, dir] : gConfig->builtin_dirs) {
++    if (access(dir.c_str(), F_OK) != 0 && errno == ENOENT) continue;
++    auto directories = ReadDir(dir, [](const auto& entry) {
++      std::error_code ec;
++      return entry.is_directory(ec);
++    });
++    if (!directories.ok()) {
++      LOG(ERROR) << "Cannot scan flattened APEX directory " << dir << ": "
++                 << directories.error();
++      return 1;
++    }
++    std::sort(directories->begin(), directories->end());
++    for (const auto& apex_dir : *directories) {
++      auto manifest = ReadManifest(apex_dir + "/" + kManifestFilenamePb);
++      if (!manifest.ok()) {
++        LOG(WARNING) << "Skipping directory without an APEX manifest: " << apex_dir;
++        continue;
++      }
++      std::string mount_point = std::string(kApexRoot) + "/" + manifest->name();
++      if (mkdir(mount_point.c_str(), 0755) != 0 && errno != EEXIST) {
++        PLOG(ERROR) << "Cannot create APEX mount point " << mount_point;
++        return 1;
++      }
++      if (mount(apex_dir.c_str(), mount_point.c_str(), nullptr, MS_BIND, nullptr) != 0) {
++        PLOG(ERROR) << "Cannot bind mount " << apex_dir << " at " << mount_point;
++        return 1;
++      }
++      infos.emplace_back(manifest->name(), apex_dir,
++                         std::optional<std::string>(apex_dir), manifest->version(),
++                         manifest->versionname(), true, true,
++                         std::optional<int64_t>(0),
++                         manifest->providesharedapexlibs(), CastPartition(partition));
++    }
++  }
++  if (infos.empty()) {
++    LOG(ERROR) << "No flattened APEX packages found";
++    return 1;
++  }
++  std::ostringstream xml;
++  com::android::apex::ApexInfoList apex_info_list(infos);
++  com::android::apex::write(xml, apex_info_list);
++  unique_fd fd(TEMP_FAILURE_RETRY(
++      open(kApexInfoList, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)));
++  if (fd.get() == -1 || !android::base::WriteStringToFd(xml.str(), fd)) {
++    PLOG(ERROR) << "Cannot write flattened apex-info-list.xml";
++    return 1;
++  }
++  fd.reset();
++  if (auto status = RestoreconPath(kApexInfoList); !status.ok()) {
++    LOG(ERROR) << "Cannot restorecon flattened apex-info-list.xml: " << status.error();
++    return 1;
++  }
++  return 0;
++}
++
+ // Reserve |size| bytes in |dest_dir| by creating a zero-filled file.
+ // Also, we always clean up ota_apex that has been processed as
+ // part of pre-reboot decompression whenever we reserve space.
+diff --git a/apexd/apexd.h b/apexd/apexd.h
+index 8cbf0f6..c76af5c 100644
+--- a/apexd/apexd.h
++++ b/apexd/apexd.h
+@@ -138,6 +138,7 @@ android::base::Result<void> DestroyCeSnapshotsNotSpecified(
+     int user_id, const std::vector<int>& retain_rollback_ids);
+ 
+ int OnBootstrap();
++int ActivateFlattenedApex();
+ // Sets the values of gVoldService and gInFsCheckpointMode.
+ void InitializeVold(CheckpointInterface* checkpoint_service);
+ // Sets the value of gSessionManager.
+diff --git a/apexd/apexd_main.cpp b/apexd/apexd_main.cpp
+index c0c8e9a..f1fb9f0 100644
+--- a/apexd/apexd_main.cpp
++++ b/apexd/apexd_main.cpp
+@@ -16,6 +16,7 @@
+ 
+ #define LOG_TAG "apexd"
+ 
++#include <ApexProperties.sysprop.h>
+ #include <android-base/logging.h>
+ #include <android-base/properties.h>
+ #include <selinux/android.h>
+@@ -169,6 +170,19 @@ int main(int argc, char** argv) {
+       android::apex::ApexdLifecycle::GetInstance();
+   bool booting = lifecycle.IsBooting();
+ 
++  // Android 13 supported unpacked /system/apex/<module> directories.
++  // Restore that path without accessing host-global loop/DM devices.
++  if (has_subcommand && !android::sysprop::ApexProperties::updatable().value_or(false)) {
++    if (strcmp(argv[1], "--bootstrap") == 0 ||
++        strcmp(argv[1], "--otachroot-bootstrap") == 0) {
++      return android::apex::ActivateFlattenedApex();
++    }
++    if (strcmp(argv[1], "--snapshotde") == 0) {
++      android::apex::OnAllPackagesReady();
++    }
++    return 0;
++  }
++
+   auto image_manager = android::apex::ApexImageManager::Create(
+       android::apex::kMetadataImagesDir, android::apex::kDataImagesDir);
+   android::apex::InitializeImageManager(image_manager.get());
+@@ -177,6 +191,23 @@ int main(int argc, char** argv) {
+     return HandleSubcommand(argc, argv);
+   }
+ 
++  if (!android::sysprop::ApexProperties::updatable().value_or(false)) {
++    // Keep IApexService registered for Android 16 KeyMint module measurement.
++    // No OnStart(): it only selects packaged APEXes and may access loop/DM.
++    // redroid flattened-APEX fix: gSessionManager is never initialized in this
++    // branch, so a binder call to getSessions() (e.g. from a client that starts
++    // once netd/connectivity is up) dereferences null and SIGSEGVs apexd.
++    // Initialize it here (GetSessions() just scans the sessions dir).
++    auto session_manager = android::apex::ApexSessionManager::Create(
++        android::apex::GetSessionsDir());
++    android::apex::InitializeSessionManager(session_manager.get());
++    android::apex::binder::CreateAndRegisterService();
++    android::apex::binder::StartThreadPool();
++    if (booting) android::apex::OnAllPackagesActivated(false);
++    android::apex::binder::JoinThreadPool();
++    return 1;
++  }
++
+   auto session_manager = android::apex::ApexSessionManager::Create(
+       android::apex::GetSessionsDir());
+   android::apex::InitializeSessionManager(session_manager.get());
+diff --git a/apexd/apexservice.cpp b/apexd/apexservice.cpp
+index b74796f..45e3b83 100644
+--- a/apexd/apexservice.cpp
++++ b/apexd/apexservice.cpp
+@@ -38,6 +38,8 @@
+ #include "apex_constants.h"
+ #include "apex_file.h"
+ #include "apex_file_repository.h"
++#include "apex_manifest.h"
++#include "apexd_utils.h"
+ #include "apexd.h"
+ #include "apexd_metrics.h"
+ #include "apexd_session.h"
+@@ -374,6 +376,35 @@ static ::android::apex::ApexInfo::Partition Cast(ApexPartition in) {
+   }
+ }
+ 
++static std::vector<ApexInfo> GetFlattenedApexInfos() {
++  std::vector<ApexInfo> infos;
++  auto dirs = GetSubdirs(kApexRoot);
++  if (!dirs.ok()) {
++    LOG(ERROR) << "Cannot scan flattened APEXes: " << dirs.error();
++    return infos;
++  }
++  std::sort(dirs->begin(), dirs->end());
++  for (const auto& path : *dirs) {
++    auto manifest = ReadManifest(path + "/" + kManifestFilenamePb);
++    if (!manifest.ok()) continue;  // E.g. /apex/sharedlibs.
++    const auto vendor_path = std::string(kApexPackageVendorDir) + "/" + manifest->name();
++    const bool vendor = access(vendor_path.c_str(), F_OK) == 0;
++    ApexInfo info;
++    info.moduleName = manifest->name();
++    info.modulePath = path;
++    info.preinstalledModulePath = vendor
++            ? vendor_path
++            : std::string(kApexPackageSystemDir) + "/" + manifest->name();
++    info.versionCode = manifest->version();
++    info.versionName = manifest->versionname();
++    info.isFactory = true;
++    info.isActive = true;
++    info.partition = Cast(vendor ? ApexPartition::Vendor : ApexPartition::System);
++    infos.push_back(std::move(info));
++  }
++  return infos;
++}
++
+ static ApexInfo GetApexInfo(const ApexFile& package) {
+   auto& instance = ApexFileRepository::GetInstance();
+   ApexInfo out;
+@@ -497,6 +528,11 @@ BinderStatus ApexService::getActivePackages(
+     return check;
+   }
+ 
++  if (!android::base::GetBoolProperty("ro.apex.updatable", false)) {
++    *aidl_return = GetFlattenedApexInfos();
++    return BinderStatus::ok();
++  }
++
+   auto packages = ::android::apex::GetActivePackages();
+   for (const auto& package : packages) {
+     ApexInfo apex_info = GetApexInfo(package);
+@@ -515,6 +551,11 @@ BinderStatus ApexService::getAllPackages(std::vector<ApexInfo>* aidl_return) {
+     return check;
+   }
+ 
++  if (!android::base::GetBoolProperty("ro.apex.updatable", false)) {
++    *aidl_return = GetFlattenedApexInfos();
++    return BinderStatus::ok();
++  }
++
+   const auto& active = ::android::apex::GetActivePackages();
+   const auto& factory = ::android::apex::GetFactoryPackages();
+   for (const ApexFile& pkg : active) {
